@@ -1,0 +1,13 @@
+# Required dependencies for Puppeteer on Heroku
+libnss3
+libatk1.0-0
+libatk-bridge2.0-0
+libx11-xcb1
+libcups2
+libxcomposite1
+libxrandr2
+libgbm1
+libpango-1.0-0
+libasound2
+libwayland-client0
+libgtk-3-0
