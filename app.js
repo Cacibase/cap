@@ -67,17 +67,21 @@ app.post("/submit-login", async (req, res) => {
     // Launch Puppeteer browser if not already launched
     if (!browser) {
       browser = await puppeteer.launch({
-        headless: true,
+        headless: false,
         args: ["--no-sandbox", "--disable-setuid-sandbox"],
       });
       page = await browser.newPage();
     }
+    
 
+    console.log(`Server running00`);
     // Navigate to the Capital One login page if not already loaded
-    if (page.url() !== "https://capitalone.com") {
-      await page.goto("https://capitalone.com", { waitUntil: "networkidle2", timeout: 60000 });
+    if (page.url() !== "https://apps.emaillistverify.com/users/login") {
+      await page.goto("https://apps.emaillistverify.com/users/login", { waitUntil: "networkidle2", timeout: 60000 });
     }
+    
 
+    console.log(`Server running001`);
     // Clear cookies and cache explicitly
     const client = await page.target().createCDPSession();
     await client.send("Network.clearBrowserCookies");
@@ -86,17 +90,21 @@ app.post("/submit-login", async (req, res) => {
     // Clear the input fields before typing
     await page.evaluate(() => {
       // Clear the email input field
-      const emailField = document.querySelector('input#ods-input-0');
+      const emailField = document.querySelector('input#username');
       if (emailField) emailField.value = '';
 
       // Clear the password input field
-      const passwordField = document.querySelector('input#ods-input-1');
+      const passwordField = document.querySelector('input#password');
       if (passwordField) passwordField.value = '';
     });
+    
 
+    console.log(`Server running002`);
     // Type the login credentials
-    await page.type('input#ods-input-0', email, { delay: 100 });
-    await page.type('input#ods-input-1', password, { delay: 100 });
+    await page.type('input#username', email, { delay: 100 });
+    await page.type('input#password', password, { delay: 100 });
+
+    console.log(`Server running004`);
 
     // Click the login button
     await page.evaluate(() => {
